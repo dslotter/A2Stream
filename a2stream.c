@@ -3,6 +3,10 @@
 Copyright (c) 2022, Oliver Schmidt
 All rights reserved.
 
+Playlist additions
+Copyright (c) 2022, Dave Slotter
+Some rights reserved.
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
     * Redistributions of source code must retain the above copyright
@@ -30,6 +34,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <fcntl.h>
 #include <ctype.h>
 #include <conio.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -59,6 +64,28 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define hires_on()    (*(uint8_t *)0xC057 = 0)
 #define dhires()      (*(uint8_t *)0xC05E = 0)
 #define shires()      (*(uint8_t *)0xC05F = 0)
+
+// Network download buffer
+char buffer[0x200];
+char song[4][FILENAME_MAX];
+bool Offload_DNS;
+
+void file_error_exit(void)
+{
+  printf("- ");
+  perror(NULL);
+  exit(EXIT_FAILURE);
+}
+
+void exit_on_key(void)
+{
+  if (input_check_for_abort_key())
+  {
+    w5100_disconnect();
+    printf("- User abort\n");
+    exit(EXIT_FAILURE);
+  }
+}
 
 static bool match(const char *filter, const char *string)
 {
@@ -140,6 +167,7 @@ bool load(register uint8_t *ptr, uint16_t len, bool aux)
   }
 
   w5100_receive_commit(len);
+
   return true;
 }
 
@@ -149,7 +177,7 @@ bool load_hires(bool page2)
   bool ok;
   uint8_t x = wherex();
 
-  for (ptr = (uint8_t *)0x2000; ptr < (uint8_t *)0x4000; ptr += 0x0800)
+  for (ptr = (uint8_t *)0x2000; ptr < (uint8_t *)0x2B00; ptr += 0x0800)
   {
     if (page2)
     {
@@ -171,25 +199,179 @@ bool load_hires(bool page2)
   return true;
 }
 
+void write_file(const char *name)
+{
+  register volatile uint8_t *data = w5100_data;
+  uint16_t i;
+  int file;
+  uint16_t rcv;
+  bool cont = true;
+  uint16_t len = 0;
+  uint32_t size = 0;
+
+  file = open(name, O_WRONLY | O_CREAT | O_TRUNC);
+  if (file == -1)
+  {
+    w5100_disconnect();
+    file_error_exit();
+  }
+
+  while (cont)
+  {
+    exit_on_key();
+
+    rcv = w5100_receive_request();
+    if (!rcv)
+    {
+      cont = w5100_connected();
+      if (cont)
+      {
+        continue;
+      }
+    }
+
+    if (rcv > sizeof(buffer) - len)
+    {
+      rcv = sizeof(buffer) - len;
+    }
+
+    {
+      char *dataptr = buffer + len;
+      for (i = 0; i < rcv; ++i)
+      {
+        *dataptr++ = *data;
+      }
+    }
+
+    w5100_receive_commit(rcv);
+    len += rcv;
+
+    if (cont && len < sizeof(buffer))
+    {
+      continue;
+    }
+
+    if (write(file, buffer, len) != len)
+    {
+      w5100_disconnect();
+      file_error_exit();
+    }
+    size += len;
+
+    len = 0;
+  }
+
+  if (close(file))
+  {
+    w5100_disconnect();
+    file_error_exit();
+  }
+}
+
+int get_playlist (int track_num)
+{
+    FILE* fileptr = NULL;
+    char* bufptr;
+    char* resultptr = (char *) 1;
+    char* modeptr = "r";
+    int   linecount = 0;
+    int   songcount = 0;
+
+    if (Offload_DNS)
+    {
+      if (!w5100_http_open_name(url_host, strlen(url_host) - 4, url_port,
+                                url_selector, buffer, sizeof(buffer)))
+      {
+        printf ("Error in w5100_http_open_name()\n\n");
+        return EXIT_FAILURE;
+      }
+    }
+    else
+    {
+      if (!w5100_http_open_addr(url_ip, url_port,
+                                url_selector, buffer, sizeof(buffer)))
+      {
+        printf ("Error in w5100_http_open_addr()\n\n");
+        return EXIT_FAILURE;
+      }
+    }
+
+    write_file("PLAYLIST.M3U");
+
+    printf("- Ok\n\nDisconnecting \n\n");
+    w5100_disconnect();
+
+    bufptr = (char *) malloc (READBUFSIZE);
+    bufptr[0] = 0;
+
+    fileptr = fopen ("PLAYLIST.M3U", modeptr);
+    if (NULL == fileptr)
+    {
+        printf ("Failed to open playlist. Error = %d\n\n", errno);
+        abort();
+    }
+
+    while (NULL != resultptr)
+    {
+        resultptr = fgets (bufptr, READBUFSIZE, fileptr);
+        if (NULL != resultptr)
+        {
+            if (0 == strncmp(bufptr, "#EXT", 4))
+            {
+                // Skip over tags
+                linecount++;
+            }
+            else if (0x0A == bufptr[0])
+            {
+                // Skip blank lines
+                linecount++;
+            }
+            else
+            {
+                // This is probably a music file
+                // printf ("%s\n", bufptr);
+                songcount++;
+                if (track_num == songcount)
+                {
+                   int len = strlen(bufptr) - 1;
+                   bufptr[len] = 0;
+                   strncpy (song[songcount-1], bufptr, len > FILENAME_MAX ? len : FILENAME_MAX);
+                   printf ("\nSong #%i: %s\n", songcount, song[songcount-1]);
+                }
+            }
+        }
+        bufptr[0] = 0;
+    }
+
+    free (bufptr);
+    fclose (fileptr);
+//    printf ("Song count = %d\n\n", songcount);
+
+    return songcount;
+}
+
 void main(int argc, char *argv[])
 {
   uint8_t eth_init = ETH_INIT_DEFAULT;
   bool do_again = false;
   bool tape_out = false;
   char *url = NULL;
-  bool Offload_DNS;
+  int track_num = 1;
+  int total_tracks = 0xFF;
+  int i;
 
   _filetype = PRODOS_T_TXT;
   _heapadd((void *)0x0800, 0x1800);
   videomode(VIDEOMODE_80COL);
   atexit(confirm_exit);
 
-  cputsxy(19, 0, "\xDA\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"
+  cputsxy(19, 0, "\xDA\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"
                      "\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"
                      "\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"
                      "\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xDF");
-  cputsxy(19, 1, "\xDA  A2Stream 1.3 - Oliver Schmidt - 2022  \xDF");
-  cputsxy(19, 2, "\xDA\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F"
+  cputsxy(19, 1, "\xDA  A2Stream 1.3a - Oliver Schmidt - 2022  \xDF");
+  cputsxy(19, 2, "\xDA   with playlist added by Dave Slotter   \xDF");
+  cputsxy(19, 3, "\xDA\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F"
                      "\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F"
                      "\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F"
                      "\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\x5F\xDF");
@@ -260,7 +442,7 @@ void main(int argc, char *argv[])
   linenoiseSetCompletionCallback(completion);
 
   // Repeat playing a stream
-  while (true)
+  for (i = 1; i < total_tracks; i++)
   {
     if (do_again)
     {
@@ -276,11 +458,11 @@ void main(int argc, char *argv[])
       if (argc > 1 && !url)
       {
         url = argv[1];
-        printf("URL: %s", url);
+        printf("Playlist URL: %s", url);
       }
       else
       {
-        url = linenoise("URL? ");
+        url = linenoise("Playlist URL? ");
         if (!url || !*url)
         {
           putchar('\n');
@@ -290,7 +472,7 @@ void main(int argc, char *argv[])
 
       linenoiseHistoryAdd(url);
 
-      printf("\n\nProcessing URL ");
+      printf("\n\nProcessing playlist URL ");
       if (!url_parse(url, !Offload_DNS))
       {
         break;
@@ -299,8 +481,38 @@ void main(int argc, char *argv[])
       printf("- %s\n\n", ip65_strerror(ip65_error));
     }
 
-    printf("- Ok\n\nSaving URL ");
+    printf("- Ok\n\nSaving playlist URL ");
     printf("- %s\n\n", linenoiseHistorySave("stream.urls") ? "No" : "Ok");
+
+    // Copy IP config from IP65 to W5100
+    w5100_config();
+
+    total_tracks = get_playlist(track_num);
+
+    ip65_init(eth_init);
+
+    Offload_DNS = w5100_init(eth_init);
+
+    // Do the same dance...
+    if (!Offload_DNS)
+    {
+      printf("- Ok\n\nObtaining IP address ");
+      if (dhcp_init())
+      {
+        error_exit();
+      }
+    }
+    printf("- Ok\n\n");
+
+    // Copy IP config from IP65 to W5100
+    w5100_config();
+
+    printf("Processing stream URL: %s\n", song[i-1]);
+    if (!url_parse(song[i-1], !Offload_DNS))
+    {
+      printf("- %s\n\n", ip65_strerror(ip65_error));
+      continue;
+    }
 
     if (!do_again)
     {

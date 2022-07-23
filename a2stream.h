@@ -34,6 +34,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #error W5100 auto-increment register access requires 65C02.
 #endif
 
+#define READBUFSIZE 256
+
 #include <stdint.h>
 
 bool load(uint8_t *ptr, uint16_t len, bool aux);
